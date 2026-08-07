@@ -1,5 +1,7 @@
 # 选中字数统计（Edge 浏览器插件）
 
+> GitHub 仓库：https://github.com/lemonade-kiku/word-counter-edge
+
 用鼠标左键选中网页上的文字，会自动弹出一个悬浮小窗，显示选中内容的：
 
 - **字数**（不含空格，汉字按字计）
