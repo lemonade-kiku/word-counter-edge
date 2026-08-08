@@ -1,5 +1,6 @@
 // 选中字数统计 — 内容脚本
-// 鼠标左键（或键盘 Shift+方向键）选中文本后，在选区附近弹出悬浮窗显示字数 / 词数 / 字符数
+// 按住 Shift + 鼠标左键拖选文本（或键盘 Shift+方向键 / Ctrl+A）后，
+// 在选区附近弹出悬浮窗显示字数 / 词数 / 字符数；普通拖选不触发
 // 悬浮窗内置"论文审查"按钮：把选中文本经 background 转发到本地桥接服务，
 // 由 Claude Code CLI 按论文写作规范审查，结果回显在悬浮窗内
 (() => {
@@ -206,9 +207,11 @@
 
   /* ---------------- 事件 ---------------- */
   // 悬浮窗仅通过右上角 ✕ 关闭（点击页面、滚动、缩放都不会收起）；
-  // 鼠标左键选中文本后弹出 / 更新内容；点击悬浮窗内部不触发更新
+  // 仅当【按住 Shift + 鼠标左键拖选】时才弹出 / 更新内容（普通拖选不触发，避免误弹）；
+  // 点击悬浮窗内部不触发更新
   document.addEventListener('mouseup', (e) => {
     if (tip && tip.contains(e.target)) return;
+    if (!e.shiftKey) return;
     const sel = getSelection();
     if (!sel) return;
     showTip(sel, e.clientX, e.clientY);
