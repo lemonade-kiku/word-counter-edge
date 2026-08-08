@@ -1,13 +1,17 @@
 {
   "manifest_version": 3,
   "name": "选中字数统计",
-  "version": "1.0.0",
-  "description": "鼠标左键选中网页文本后，自动弹出悬浮窗显示选中内容的字数、词数与字符数。",
+  "version": "1.1.0",
+  "description": "鼠标左键选中网页文本后，自动弹出悬浮窗显示字数/词数/字符数，并可一键调用本地 Claude Code 对选中文本进行论文写作审查。",
   "icons": {
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",
     "128": "icons/icon128.png"
   },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "host_permissions": ["http://127.0.0.1:8899/*"],
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
