@@ -1,8 +1,10 @@
 // 选中字数统计 — 内容脚本
 // 按住 Shift + 鼠标左键拖选文本（或键盘 Shift+方向键 / Ctrl+A）后，
 // 在选区附近弹出悬浮窗显示字数 / 词数 / 字符数；普通拖选不触发
-// 悬浮窗内置"论文审查"按钮：把选中文本经 background 转发到本地桥接服务，
-// 由 Claude Code CLI 按论文写作规范审查，结果回显在悬浮窗内
+// 悬浮窗内置"论文审查"按钮：把选中文本【直接 fetch】本地桥接服务（不经过
+// 扩展后台中转——MV3 的 service worker 会被浏览器按生命周期回收，审查中途
+// 一断结果就丢；弹窗直连后 SW 生死不影响审查），由 Claude Code CLI 按论文
+// 写作规范审查，结果流式回显在悬浮窗内
 (() => {
   'use strict';
 
@@ -10,8 +12,12 @@
 
   const TIP_ID = 'wc-count-tip';
   const MAX_TEXT_LEN = 6000; // 与 bridge.js 保持一致
+  const REVIEW_URL = 'http://127.0.0.1:8899/review';
+  const ABORT_URL = 'http://127.0.0.1:8899/abort';
+  const REVIEW_TIMEOUT_MS = 480000; // 客户端兜底超时（8 分钟；桥接服务 7 分钟超时会更早触发）
   let tip = null;
   let reviewPending = false; // 审查进行中：悬浮窗保持显示，防止结果丢失
+  let reviewCtrl = null;     // 当前审查的 AbortController（点 ✕ / 超时时中止）
 
   /* ---------------- 统计 ---------------- */
   function countText(text) {
@@ -53,9 +59,14 @@
 
   /* ---------------- 悬浮窗 ---------------- */
   function ensureTip() {
+    // 页面脚本可能偷偷删掉/替换悬浮窗节点；被删则下次重建
+    if (tip && !tip.isConnected) tip = null;
     if (tip) return tip;
     tip = document.createElement('div');
     tip.id = TIP_ID;
+    // 用 closed shadow DOM 承载全部内容：页面脚本读不到悬浮窗里的文字
+    // （含审查结果），也点不到里面的按钮——恶意页面无法窃取审查输出
+    tip.__wcRoot = tip.attachShadow({ mode: 'closed' });
     tip.setAttribute('aria-hidden', 'true');
     tip.style.cssText = [
       'position:fixed',
@@ -77,7 +88,15 @@
   }
 
   function hideTip() {
-    if (reviewPending) return; // 审查期间不允许收起，保证结果可见
+    if (reviewPending) { abortReview(); return; } // 审查中：✕ = 中止审查并收起
+    if (tip) tip.style.display = 'none';
+  }
+
+  // 中止当前审查：abort fetch + 通知桥接服务杀掉 claude 进程树（释放 busy）
+  function abortReview() {
+    if (reviewCtrl) { reviewCtrl.abort(); reviewCtrl = null; }
+    fetch(ABORT_URL, { method: 'POST' }).catch(() => {});
+    reviewPending = false;
     if (tip) tip.style.display = 'none';
   }
 
@@ -86,7 +105,7 @@
     const el = ensureTip();
     // 记忆本次选中的文本，供"论文审查"按钮使用
     el.__wcText = sel.text;
-    el.innerHTML =
+    el.__wcRoot.innerHTML =
       '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px">' +
         '<div>' +
           '<div>字数 <b>' + s.noSpace + '</b> · 词数 <b>' + s.words + '</b></div>' +
@@ -99,10 +118,10 @@
         '<button id="wc-review-btn" style="' + btnCss() + '">📝 论文审查</button>' +
       '</div>' +
       '<div id="wc-status" style="display:none;margin-top:6px;border-top:1px solid rgba(255,255,255,.15);padding-top:6px;max-width:440px;max-height:55vh;overflow:auto;white-space:pre-wrap;word-break:break-word;font:12px/1.7 "Microsoft YaHei", system-ui, sans-serif"></div>';
-    const btn = el.querySelector('#wc-review-btn');
-    if (btn) btn.addEventListener('click', () => startReview(el));
-    const closeBtn = el.querySelector('#wc-close-btn');
-    if (closeBtn) closeBtn.addEventListener('click', hideTip);
+    const btn = el.__wcRoot.querySelector('#wc-review-btn');
+    if (btn) btn.addEventListener('click', (ev) => { if (ev.isTrusted) startReview(el); });
+    const closeBtn = el.__wcRoot.querySelector('#wc-close-btn');
+    if (closeBtn) closeBtn.addEventListener('click', (ev) => { if (ev.isTrusted) hideTip(); });
 
     // 先显示再测量：display:none 时 offsetWidth/offsetHeight 为 0，会导致定位不准
     el.style.display = 'block';
@@ -134,17 +153,45 @@
   }
 
   function setStatus(el, text, isError) {
-    const st = el.querySelector('#wc-status');
+    const st = el.__wcRoot.querySelector('#wc-status');
     st.textContent = text;
     st.style.color = isError ? '#ff9e9e' : '';
     st.style.display = 'block';
   }
 
-  /* ---------------- 论文审查 ---------------- */
-  function startReview(el) {
-    const btn = el.querySelector('#wc-review-btn');
+  /* ---------------- 复制（带 http 页面兜底） ---------------- */
+  function copyText(text, btn) {
+    const done = () => {
+      btn.textContent = '✅ 已复制';
+      setTimeout(() => { btn.textContent = '📋 复制结果'; }, 1500);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(done).catch(() => { if (fallbackCopy(text)) done(); });
+    } else if (fallbackCopy(text)) {
+      done();
+    }
+  }
+
+  function fallbackCopy(text) {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.cssText = 'position:fixed;top:-9999px;opacity:0';
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand('copy');
+      ta.remove();
+      return ok;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /* ---------------- 论文审查（弹窗直连桥接服务，流式） ---------------- */
+  async function startReview(el) {
+    const btn = el.__wcRoot.querySelector('#wc-review-btn');
     const text = (el.__wcText || '').trim();
-    if (!text) return;
+    if (!text || btn.disabled) return;
     if (text.length > MAX_TEXT_LEN) {
       setStatus(el, '选中文本过长（' + text.length + ' 字符，上限 ' + MAX_TEXT_LEN + '），请分段审查。', true);
       return;
@@ -154,72 +201,162 @@
     btn.disabled = true;
     btn.textContent = '⏳ 审查中…';
     btn.style.opacity = '.6';
-    setStatus(el, '正在连接本地 Claude Code…（约需 30~90 秒，完成前悬浮窗将保持显示）');
 
-    chrome.runtime.sendMessage({ type: 'review', text }, (resp) => {
+    // 状态区：状态行 + 实时输出容器
+    const st = el.__wcRoot.querySelector('#wc-status');
+    st.innerHTML = '';
+    const statusLine = document.createElement('div');
+    statusLine.textContent = '正在连接本地 Claude Code…';
+    const pre = document.createElement('div');
+    pre.style.cssText = 'white-space:pre-wrap;word-break:break-word;line-height:1.7;margin-top:4px';
+    st.appendChild(statusLine);
+    st.appendChild(pre);
+    st.style.display = 'block';
+    st.style.color = '';
+
+    let acc = '';
+    let finished = false;
+    const ctrl = new AbortController();
+    reviewCtrl = ctrl;
+
+    // 心跳：审查可能数分钟无正文输出（文献核对阶段），用已用时长告诉用户仍在运行
+    const t0 = Date.now();
+    const beat = setInterval(() => {
+      if (!finished) {
+        statusLine.textContent = '⏳ 审查中，已运行 ' + Math.round((Date.now() - t0) / 1000) +
+          ' 秒（文献核对需读原文，请耐心等待）';
+      }
+    }, 5000);
+
+    // 统一收尾：只触发一次；重置按钮 / reviewPending / 心跳 / 超时定时器
+    let timeoutTimer = null;
+    const finish = (ok, msg) => {
+      if (finished) return;
+      finished = true;
+      clearInterval(beat);
+      if (timeoutTimer) clearTimeout(timeoutTimer);
       reviewPending = false;
-      if (chrome.runtime.lastError) {
-        btn.disabled = false;
+      reviewCtrl = null;
+      btn.disabled = false;
+      btn.style.opacity = '';
+      if (ok) {
+        btn.textContent = '📝 重新审查';
+        statusLine.textContent = '✅ 审查完成（用时 ' + msg + ' 秒）';
+        statusLine.style.cssText = 'color:#9fe0a0;font-weight:bold';
+        const row = document.createElement('div');
+        row.style.cssText = 'display:flex;gap:6px;margin-top:6px';
+        const copyBtn = document.createElement('button');
+        copyBtn.style.cssText = btnCss();
+        copyBtn.textContent = '📋 复制结果';
+        copyBtn.addEventListener('click', () => copyText(acc, copyBtn));
+        row.appendChild(copyBtn);
+        st.appendChild(row);
+      } else {
         btn.textContent = '📝 重试审查';
-        btn.style.opacity = '';
-        setStatus(el, '扩展通信失败：' + chrome.runtime.lastError.message, true);
-        return;
+        statusLine.textContent = '❌ 审查失败';
+        statusLine.style.cssText = 'color:#ff9e9e;font-weight:bold';
+        const errPre = document.createElement('div');
+        errPre.style.cssText = 'white-space:pre-wrap;word-break:break-word;line-height:1.7;margin-top:4px;color:#ff9e9e';
+        errPre.textContent = msg || '未知错误';
+        st.appendChild(errPre);
       }
-      if (!resp || !resp.ok) {
-        btn.disabled = false;
-        btn.textContent = '📝 重试审查';
-        btn.style.opacity = '';
-        setStatus(el, (resp && resp.error) ? resp.error : '审查失败，请查看桥接服务窗口的日志。', true);
-        return;
+    };
+
+    timeoutTimer = setTimeout(() => { ctrl.abort(); }, REVIEW_TIMEOUT_MS);
+
+    try {
+      const res = await fetch(REVIEW_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text }),
+        signal: ctrl.signal
+      });
+      if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        throw new Error('桥接服务返回 ' + res.status + (body ? '：' + body.slice(0, 200) : ''));
       }
 
-      // 审查成功：显示结果 + 复制 / 关闭按钮
-      btn.disabled = false;
-      btn.textContent = '📝 重新审查';
-      btn.style.opacity = '';
-      const st = el.querySelector('#wc-status');
-      st.innerHTML = '';
-      const done = document.createElement('div');
-      done.style.cssText = 'color:#9fe0a0;margin-bottom:4px;font-weight:bold';
-      done.textContent = '✅ 审查完成（用时 ' + (resp.seconds || '') + ' 秒）';
-      const pre = document.createElement('div');
-      pre.style.cssText = 'white-space:pre-wrap;word-break:break-word;line-height:1.7';
-      pre.textContent = resp.result;
-      const row = document.createElement('div');
-      row.style.cssText = 'display:flex;gap:6px;margin-top:6px';
-      const copyBtn = document.createElement('button');
-      copyBtn.style.cssText = btnCss();
-      copyBtn.textContent = '📋 复制结果';
-      copyBtn.addEventListener('click', () => {
-        navigator.clipboard.writeText(resp.result).then(() => {
-          copyBtn.textContent = '✅ 已复制';
-          setTimeout(() => { copyBtn.textContent = '📋 复制结果'; }, 1500);
-        });
-      });
-      row.appendChild(copyBtn);
-      st.appendChild(done);
-      st.appendChild(pre);
-      st.appendChild(row);
-      st.style.display = 'block';
-      st.style.color = '';
-    });
+      // 读取流式响应：正文流式增量显示；结尾按 NUL 分隔符切出标记
+      // （\u0000DONE 秒数\n 表示完成，\u0000ERROR 消息\n 表示失败）
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      while (true) {
+        const { value, done: rdDone } = await reader.read();
+        if (rdDone) break;
+        buf += decoder.decode(value, { stream: true });
+        const nul = buf.indexOf('\u0000');
+        if (nul < 0) {
+          // 标记尚未到达：buf 全部是正文，增量显示（多字节字符由 TextDecoder 跨块正确拼接）
+          if (buf) {
+            acc += buf;
+            pre.textContent = acc;
+            st.scrollTop = st.scrollHeight;
+            buf = '';
+          }
+        } else {
+          // 标记到达：NUL 之前是正文，之后是标记行
+          const bodyText = buf.slice(0, nul);
+          if (bodyText) {
+            acc += bodyText;
+            pre.textContent = acc;
+            st.scrollTop = st.scrollHeight;
+          }
+          let rest = buf.slice(nul + 1);
+          let nl = rest.indexOf('\n');
+          // 标记行可能被网络分块切断，跨块拼接直到拿到完整行
+          while (nl < 0) {
+            const next = await reader.read();
+            if (next.done) break;
+            rest += decoder.decode(next.value, { stream: true });
+            nl = rest.indexOf('\n');
+          }
+          const marker = nl < 0 ? rest : rest.slice(0, nl);
+          if (marker.startsWith('DONE')) finish(true, marker.slice(5).trim());
+          else if (marker.startsWith('ERROR')) finish(false, marker.slice(6).trim());
+          else finish(false, '连接中断：无法识别的完成标记');
+          reader.cancel().catch(() => {});
+          break;
+        }
+      }
+      // 流自然结束但未收到标记：桥接端异常（正常时桥接总在结束前写标记）
+      if (!finished) finish(false, '连接中断：未收到完成标记');
+    } catch (e) {
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      if (e && e.name === 'AbortError') {
+        // 超时中止（✕ 中止时 reviewPending 已被 abortReview 置 false，静默收起）
+        if (reviewPending) {
+          finish(false, '审查超时（超过 ' + Math.round(REVIEW_TIMEOUT_MS / 60000) + ' 分钟）');
+        }
+      } else if (e && typeof e.message === 'string' && e.message.indexOf('桥接服务返回') === 0) {
+        finish(false, e.message);
+      } else {
+        finish(false, '无法连接本地桥接服务。请先双击运行 bridge\\start-bridge.bat，然后重试。');
+      }
+    }
   }
 
   /* ---------------- 事件 ---------------- */
-  // 悬浮窗仅通过右上角 ✕ 关闭（点击页面、滚动、缩放都不会收起）；
+  // 悬浮窗仅通过右上角 ✕ 关闭（点击页面、滚动、缩放都不会收起；审查中 ✕ 会中止审查）；
   // 仅当【按住 Shift + 鼠标左键拖选】时才弹出 / 更新内容（普通拖选不触发，避免误弹）；
-  // 点击悬浮窗内部不触发更新
+  // 点击悬浮窗内部不触发更新；审查进行中禁止重建弹窗（否则正在流式的结果会写进分离节点丢失）
   document.addEventListener('mouseup', (e) => {
     if (tip && tip.contains(e.target)) return;
+    if (!e.isTrusted) return; // 只响应真实用户操作，无视页面脚本派发的合成事件
     if (!e.shiftKey) return;
+    if (reviewPending) return;
     const sel = getSelection();
     if (!sel) return;
     showTip(sel, e.clientX, e.clientY);
   }, true);
-  // 键盘选择（Shift + 方向键、Ctrl + A 等）
+  // 键盘选择（Shift + 方向键 / Home/End/Page / Ctrl+A）。
+  // 只认选择相关按键：排除裸 Shift / Ctrl 松开（普通拖选后 Ctrl+C 复制会误弹窗）
   document.addEventListener('keyup', (e) => {
-    if (!(e.key === 'Shift' || e.key === 'Control' ||
-          /^Arrow|^Home$|^End$|^Page/.test(e.key))) return;
+    if (!e.isTrusted) return; // 只响应真实键盘操作，无视页面派发的合成事件
+    if (reviewPending) return;
+    const isNav = /^Arrow|^Home$|^End$|^Page/.test(e.key);
+    const isSelectAll = e.ctrlKey && (e.key === 'a' || e.key === 'A');
+    if (!isNav && !isSelectAll) return;
     const sel = getSelection();
     if (!sel) return;
     showTip(sel, 0, 0);
