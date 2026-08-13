@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "选中字数统计",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "按住 Shift+鼠标左键选中网页文本，弹出悬浮窗显示字数/词数/字符数，并可一键调用本地 Claude Code 对选中文本进行论文写作审查。",
   "icons": {
     "16": "icons/icon16.png",

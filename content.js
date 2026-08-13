@@ -20,12 +20,12 @@
   let reviewCtrl = null;     // 当前审查的 AbortController（点 ✕ / 超时时中止）
 
   /* ---------------- 统计 ---------------- */
+  // 所有统计都不计入空格（含换行、制表符等空白字符）
   function countText(text) {
-    const total = text.length;                                   // 字符数（含空格）
-    const noSpace = text.replace(/\s+/g, '').length;             // 字符数（不含空格）
+    const noSpace = text.replace(/\s+/g, '').length;             // 字数（不含空格，汉字按字计）
     const cjk = (text.match(/[㐀-䶿一-鿿豈-﫿]/g) || []).length; // 汉字数
     const latin = (text.match(/[A-Za-z0-9]+(?:[’'-][A-Za-z0-9]+)*/g) || []).length; // 英文单词数
-    return { total, noSpace, cjk, latin, words: cjk + latin };   // 词数 = 汉字 + 英文单词
+    return { noSpace, cjk, latin, words: cjk + latin };          // 词数 = 汉字 + 英文单词
   }
 
   /* ---------------- 获取选中内容 ---------------- */
@@ -39,8 +39,9 @@
       if (typeof s === 'number' && typeof e === 'number' && e > s) {
         const text = el.value.slice(s, e).trim();
         if (text) return { text, rect: el.getBoundingClientRect() };
-        return null;
       }
+      // 输入框里没有新选区时不拦截——回退到下面的页面选区逻辑，
+      // 否则焦点停在输入框里时，在页面上 Shift 拖选新文本弹窗不会更新
     }
     // 普通页面文本
     const sel = window.getSelection();
@@ -109,8 +110,7 @@
       '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px">' +
         '<div>' +
           '<div>字数 <b>' + s.noSpace + '</b> · 词数 <b>' + s.words + '</b></div>' +
-          '<div style="opacity:.75;margin-top:2px">字符 ' + s.total +
-          '（含空格）· 汉字 ' + s.cjk + ' · 英文单词 ' + s.latin + '</div>' +
+          '<div style="opacity:.75;margin-top:2px">汉字 ' + s.cjk + ' · 英文单词 ' + s.latin + '</div>' +
         '</div>' +
         '<button id="wc-close-btn" title="关闭" style="background:none;border:none;color:rgba(255,255,255,.55);cursor:pointer;font:14px/1 system-ui;padding:0 2px">✕</button>' +
       '</div>' +
